@@ -1,9 +1,9 @@
-import { useEffect, useState, useRef, useCallback } from 'react'
-import type { ChangeEvent, KeyboardEvent } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import type { KeyboardEvent } from 'react'
 import { joinRoom } from 'trystero'
 
 const APP_ID = 'trystero-react-vite-ts-demo-001'
-const ROOM_ID = 'ts-test-room-01'
+const MAX_USERS = 2
 
 type Room = ReturnType<typeof joinRoom>
 
@@ -13,128 +13,171 @@ type ChatMsg = {
     self: boolean
 }
 
-// 串行化 leave -> join：StrictMode 下 effect 会 mount/unmount/mount，
-// 0.27+ 对同一 room 重复 joinRoom 会抛错，所以必须等上一次 leave 完成
 let leaving: Promise<unknown> = Promise.resolve()
 
 export default function TrysteroDemo() {
-    const [myColor, setMyColor] = useState('#ff0000')
-    const [peerColors, setPeerColors] = useState<Record<string, string>>({})
+    const [roomIdInput, setRoomIdInput] = useState('ts-test-room-01')
+    const [passwordInput, setPasswordInput] = useState('')
+    const [activeRoom, setActiveRoom] = useState<{
+        roomId: string
+        password: string
+    } | null>(null)
+
     const [msgList, setMsgList] = useState<ChatMsg[]>([])
     const [inputMsg, setInputMsg] = useState('')
+    const [status, setStatus] = useState('尚未加入房间')
+    const [peerIds, setPeerIds] = useState<string[]>([])
 
-    const myColorRef = useRef(myColor)
     const roomRef = useRef<Room | null>(null)
-    const sendRef = useRef<{
-        sendColor: ((c: string) => void) | null
-        sendChat: ((txt: string) => void) | null
-    }>({ sendColor: null, sendChat: null })
+    const sendChatRef = useRef<((text: string) => void) | null>(null)
 
     useEffect(() => {
+        if (!activeRoom) return
+
         let cancelled = false
+        let room: Room | null = null
         const offs: Array<() => void> = []
 
-        leaving.then(() => {
+        setStatus('正在加入房间…')
+        setMsgList([])
+        setPeerIds([])
+
+        leaving = leaving.then(() => {
             if (cancelled) return
 
-            const room = joinRoom({ appId: APP_ID }, ROOM_ID)
+            room = joinRoom(
+                {
+                    appId: APP_ID,
+                    password: activeRoom.password,
+                    maxUsers: MAX_USERS,
+                },
+                activeRoom.roomId,
+            )
+
             roomRef.current = room
 
-            const colorAction = room.makeAction<string>('color')
             const chatAction = room.makeAction<string>('chat')
 
-            // onMessage(handler) -> 返回 unsubscribe；handler 签名 (data, { peerId, userId })
-            offs.push(
-                colorAction.onMessage((color, { peerId }) => {
-                    setPeerColors(prev => ({ ...prev, [peerId]: color }))
-                }),
-            )
             offs.push(
                 chatAction.onMessage((text, { peerId }) => {
                     setMsgList(prev => [...prev, { peerId, text, self: false }])
                 }),
             )
 
-            // 新 peer 加入：把我当前的颜色单独发给它
             offs.push(
                 room.onPeerJoin(({ peerId }) => {
-                    colorAction
-                        .send(myColorRef.current, { target: peerId })
-                        .catch(() => {})
-                }),
-            )
-            offs.push(
-                room.onPeerLeave(({ peerId }) => {
-                    setPeerColors(prev => {
-                        const next = { ...prev }
-                        delete next[peerId]
-                        return next
-                    })
+                    setPeerIds(prev =>
+                        prev.includes(peerId) ? prev : [...prev, peerId],
+                    )
+                    setStatus('已加入房间')
                 }),
             )
 
-            sendRef.current.sendColor = c => {
-                colorAction.send(c).catch(() => {})
+            offs.push(
+                room.onPeerLeave(({ peerId }) => {
+                    setPeerIds(prev => prev.filter(id => id !== peerId))
+                }),
+            )
+
+            sendChatRef.current = text => {
+                chatAction.send(text).catch(() => {})
             }
-            sendRef.current.sendChat = txt => {
-                chatAction.send(txt).catch(() => {})
-            }
+
+            setStatus('已加入房间，等待其他玩家…')
+        }).catch(error => {
+            setStatus(`加入失败：${String(error)}`)
         })
 
         return () => {
             cancelled = true
             offs.forEach(off => off())
-            sendRef.current = { sendColor: null, sendChat: null }
-            const room = roomRef.current
-            roomRef.current = null
-            if (room) {
+            sendChatRef.current = null
+
+            if (room && roomRef.current === room) {
+                roomRef.current = null
                 leaving = Promise.resolve(room.leave()).catch(() => {})
             }
         }
-    }, [])
+    }, [activeRoom])
 
-    const handleColorChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
-        const c = e.target.value
-        setMyColor(c)
-        myColorRef.current = c
-        sendRef.current.sendColor?.(c)
-    }, [])
+    const handleJoin = () => {
+        const roomId = roomIdInput.trim()
+        const password = passwordInput
 
-    const handleSendChat = useCallback(() => {
+        if (!roomId) {
+            setStatus('请填写房间号')
+            return
+        }
+
+        if (!password) {
+            setStatus('请填写房间密码')
+            return
+        }
+
+        setActiveRoom({ roomId, password })
+    }
+
+    const handleLeave = () => {
+        setActiveRoom(null)
+        setStatus('已离开房间')
+        setPeerIds([])
+        setMsgList([])
+    }
+
+    const handleSendChat = () => {
         const text = inputMsg.trim()
-        if (!text) return
-        sendRef.current.sendChat?.(text)
+        if (!text || !roomRef.current) return
+
+        sendChatRef.current?.(text)
         setMsgList(prev => [...prev, { peerId: 'me', text, self: true }])
         setInputMsg('')
-    }, [inputMsg])
+    }
 
-    const onKeyEnter = (e: KeyboardEvent<HTMLInputElement>) => {
-        if (e.key === 'Enter') handleSendChat()
+    const onKeyEnter = (event: KeyboardEvent<HTMLInputElement>) => {
+        if (event.key === 'Enter') handleSendChat()
     }
 
     return (
         <div style={{ padding: 24, maxWidth: 600, margin: '0 auto' }}>
-            <h2>Trystero TS Demo</h2>
-            <p>同一个 RoomId，使用无痕窗口测试</p>
+            <h2>Trystero 聊天 Demo</h2>
 
-            <div style={{ margin: '16px 0' }}>
-                <label>我的颜色：</label>
-                <input type="color" value={myColor} onChange={handleColorChange} />
+            <div style={{ display: 'grid', gap: 8, margin: '16px 0' }}>
+                <label>
+                    房间号：
+                    <input
+                        value={roomIdInput}
+                        onChange={event => setRoomIdInput(event.target.value)}
+                        disabled={!!activeRoom}
+                    />
+                </label>
+
+                <label>
+                    房间密码：
+                    <input
+                        type="password"
+                        value={passwordInput}
+                        onChange={event => setPasswordInput(event.target.value)}
+                        disabled={!!activeRoom}
+                    />
+                </label>
+
+                <div>
+                    {!activeRoom ? (
+                        <button onClick={handleJoin}>加入房间</button>
+                    ) : (
+                        <button onClick={handleLeave}>离开房间</button>
+                    )}
+                </div>
             </div>
 
-            <div>
-                <h4>在线Peer颜色</h4>
-                <ul>
-                    {Object.entries(peerColors).map(([pid, c]) => (
-                        <li key={pid} style={{ background: c, padding: 4 }}>
-                            {pid}: {c}
-                        </li>
-                    ))}
-                </ul>
-            </div>
+            <p>状态：{status}</p>
+            <p>
+                在线人数：{activeRoom ? peerIds.length + 1 : 0} / {MAX_USERS}
+            </p>
 
             <div style={{ marginTop: 20 }}>
                 <h4>聊天</h4>
+
                 <div
                     style={{
                         height: 180,
@@ -143,21 +186,33 @@ export default function TrysteroDemo() {
                         padding: 8,
                     }}
                 >
-                    {msgList.map((m, i) => (
-                        <div key={i} style={{ textAlign: m.self ? 'right' : 'left' }}>
-                            {m.self ? '我' : m.peerId}: {m.text}
+                    {msgList.map((message, index) => (
+                        <div
+                            key={index}
+                            style={{
+                                textAlign: message.self ? 'right' : 'left',
+                            }}
+                        >
+                            {message.self ? '我' : message.peerId}:{' '}
+                            {message.text}
                         </div>
                     ))}
                 </div>
+
                 <div style={{ marginTop: 8 }}>
                     <input
                         value={inputMsg}
-                        onChange={e => setInputMsg(e.target.value)}
+                        onChange={event => setInputMsg(event.target.value)}
                         onKeyDown={onKeyEnter}
                         placeholder="输入消息"
+                        disabled={!activeRoom}
                         style={{ width: 300 }}
                     />
-                    <button onClick={handleSendChat} style={{ marginLeft: 8 }}>
+                    <button
+                        onClick={handleSendChat}
+                        disabled={!activeRoom}
+                        style={{ marginLeft: 8 }}
+                    >
                         发送
                     </button>
                 </div>
